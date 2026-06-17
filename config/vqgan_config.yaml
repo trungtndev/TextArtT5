@@ -1,0 +1,74 @@
+seed_everything: 42
+trainer:
+  deterministic: true
+  enable_checkpointing: true
+  accelerator: gpu
+  devices: 1
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 200
+  precision: 32
+  max_epochs: 1000
+  num_sanity_val_steps: 0
+
+callbacks:
+  lr_monitor:
+    logging_interval: step
+  image_logger:
+    batch_frequency: 500
+    max_images: 4
+    increase_log_steps: false
+  ckpt_callback:
+    save_top_k: 1
+    monitor: val_ssim
+    mode: max
+    filename: '{epoch}-{step}-{val_ssim:.4f}'
+
+wandb:
+  name: EMA-VQGAN-f8-1024-151M
+  project: "TextArt"
+  log_model: all
+  mode: "offline"
+
+model:
+  train_config:
+    learning_rate: 1.0e-4  # base: 4.5e-6 / 2.7e-05
+    dis_learning_rate: 1.0e-4
+    interval: step
+    log_hist_every_n_steps: 1000
+#    accumulate_grad_batches: 16
+#    gradient_clip_val: 1.0
+    cosine_scheduler:
+      t_in_epochs: false
+      t_initial: 1 # 17767 or 4442 step / epoch ******** 17767 * 1 = 17767
+      lr_min: 1.0e-4
+      cycle_mul: 1.0
+      cycle_limit: 1
+      cycle_decay: 1.0 # lr_new = lr_old * cycle_decay
+
+    dis_cosine_scheduler:
+      t_in_epochs: false
+      t_initial: 1
+      lr_min: 1.0e-4
+      cycle_mul: 1.0
+      cycle_limit: 1
+      cycle_decay: 1.0
+
+  loss_config:
+    disc_ndf: 64
+    disc_num_layers: 3
+    use_actnorm: false
+    disc_conditional: false
+    disc_in_channels: 3
+    disc_start: 52001
+    disc_weight: 0.5
+    codebook_weight: 1.0
+    perceptual_weight: 1.0
+
+data:
+  image_size: [ 256, 256 ] # [ 192, 512 ]
+  data_path: /path/to/CelebA-Dialog
+  img_type: png
+  train_batch_size: 32
+  eval_batch_size: 32
+  num_workers: 24
+  aug: true

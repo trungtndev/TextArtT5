@@ -1,0 +1,17 @@
+albumentations==2.0.8
+opencv-python
+torch==2.10.0
+torchvision==0.25.0
+pillow
+pytorch-lightning==2.5.0
+torchmetrics==1.8.0
+wandb
+sconf
+timm
+pandas
+einops
+setproctitle
+transformers==5.2.0
+matplotlib==3.9.2
+matplotlib-inline==0.1.7
+numpy==1.26.4
