@@ -1,4 +1,4 @@
-# TextArtT5: Autoregressive Text-to-Image with EMA VQGAN and T5
+# TextArtT5: Multimodal Text-to-Image with Discrete Latent Space
 
 This project is an ongoing effort to build a Text-to-Image generation system based on an **Autoregressive Transformer** architecture combined with an **EMA VQGAN**.
 
