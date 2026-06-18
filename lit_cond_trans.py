@@ -41,24 +41,8 @@ class LitAutoRegression(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        # self.tokenizer = EMAVQGAN.from_pretrained(image_tokenizer_path_or_id).eval()
+        self.tokenizer = EMAVQGAN.from_pretrained(image_tokenizer_path_or_id).eval()
 
-        self.tokenizer = EMAVQGAN(
-            config=VQGANConfig(
-                n_embed=1024,
-                embed_dim=32,
-                dd_config=DDConfig(
-                    in_channels=3,
-                    out_ch=3,
-                    ch=32,
-                    z_channels=32,
-                    num_res_blocks=2,
-                    ch_mult=[1, 1, 2, 2, 4],  # num_down = len(ch_mult)-1
-                    resolution=256,
-                    attn_resolutions=[],
-                    double_z=False,
-                ),
-            )).eval()
         for param in self.tokenizer.parameters():
             param.requires_grad = False
 
