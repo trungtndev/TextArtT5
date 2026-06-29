@@ -1,5 +1,15 @@
 # TextArtT5: Multimodal Text-to-Image with Discrete Latent Space
 
+---
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.12-3776AB?style=flat&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white" alt="PyTorch">
+  <img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Transformers-FFD21E?style=flat" alt="Hugging Face">
+  <img src="https://img.shields.io/badge/vLLM-Engine-deepskyblue?style=flat&logo=unraid&logoColor=white" alt="vLLM">
+  <img src="https://img.shields.io/badge/Status-In%20Development-6f42c1?style=flat" alt="Status">
+</p>
+
 This project is an ongoing effort to build a Text-to-Image generation system based on an **Autoregressive Transformer** architecture combined with an **EMA VQGAN**.
 
 > **IMPORTANT NOTICE REGARDING SOURCE CODE & PRE-TRAINED WEIGHTS:**
@@ -58,6 +68,8 @@ Currently, the **Stage 1 (VQGAN)** model can stably compress and decode (reconst
 ---
 ## Setup and Installation
 ```bash
+conda create -n textart python=3.12 -y
+conda activate textart
 pip install -r requirements.txt
 ```
 
@@ -79,6 +91,10 @@ Once Stage 1 is fully trained, freeze the VQGAN encoder and train the conditiona
 ```bash
 python train_cond_trans.py --config config/ar_config.yaml
 ```
+
+### 3. High-Performance Inference (vLLM Engine)
+The custom vLLM model architecture implementation for high-throughput serving is already provided at `src/TextArtT5/vllm_textartt5.py`. Dedicated inference scripts and CLI commands to host and serve the model directly via the vLLM engine will be officially supported soon, alongside the release of our pre-trained weights.
+
 
 ---
 

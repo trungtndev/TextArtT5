@@ -7,9 +7,8 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 
 from src.model.vqgan.vqperceptual import VQLPIPSWithDiscriminator
 from src.utils.utils import log_parameters
-from src.vqgan import VQGANConfig, DDConfig, VQGAN, EMAVQGAN
+from src.vqgan import EMAVQGAN
 import wandb
-
 
 class LitVQGAN(pl.LightningModule):
     def __init__(
@@ -87,7 +86,7 @@ class LitVQGAN(pl.LightningModule):
                 self.disc_step += 1
 
         # Codebook utilization
-        flat = indices.long().view(-1)  # Get 1 sample's indices
+        flat = indices.long().view(-1) # Get 1 sample's indices
         counts = torch.bincount(flat, minlength=self.K)
         utilization = (counts > 0).float().mean()
 

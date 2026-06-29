@@ -71,11 +71,7 @@ def train(config: Config):
         forced_eos_token_id=codebook_size + 3,
     )
     model_module = LitAutoRegression(**config.model, scribenet_config=config_net)
-    # model_module = LitNonRegression(**config.model)
 
-    # model_module = LatentDiffusion(**config.model)
-
-    # data_module = VQGANDatamodule(**config.data)
     data_module = CelebADatamodule(**config.data)
 
     lr_callback = pl.callbacks.LearningRateMonitor(**config.callbacks.lr_monitor)

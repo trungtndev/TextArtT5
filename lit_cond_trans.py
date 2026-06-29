@@ -9,7 +9,7 @@ from src.TextArtT5.TextArtT5 import TextArtT5Config, TextArtT5ForConditionalGene
 from src.TextArtT5.processor import TextArtT5Processor
 
 from src.utils.utils import log_parameters
-from src.vqgan import EMAVQGAN, VQGAN, VQGANConfig, DDConfig
+from src.vqgan import EMAVQGAN, VQGANConfig, DDConfig
 
 
 def create_stage_bundle(seed, device='cuda'):
@@ -99,10 +99,11 @@ class LitAutoRegression(pl.LightningModule):
 
             pad_id = self.model.config.pad_token_id
             eos_id = self.model.config.eos_token_id
+            bos_id = self.model.config.bos_token_id
 
             mask &= (decoder_ids != pad_id)
             mask &= (decoder_ids != eos_id)
-            mask &= (decoder_ids != 151644)  # bos ~ <|im_start|>
+            mask &= (decoder_ids != bos_id)
 
             r_indices = torch.randint(
                 low=0,
@@ -117,7 +118,7 @@ class LitAutoRegression(pl.LightningModule):
         outputs = self(**inputs, labels=labels)
         loss = outputs.loss
 
-        self.log("train/loss", loss, prog_bar=True, on_step=True, logger=True)
+        self.log("train_loss", loss, prog_bar=True, on_step=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -139,7 +140,7 @@ class LitAutoRegression(pl.LightningModule):
         outputs = self(**inputs, labels=labels)
         loss = outputs.loss
 
-        self.log("val/loss", loss, prog_bar=True, on_step=True, logger=True)
+        self.log("val_loss", loss, prog_bar=True, on_step=True, logger=True)
         return loss
 
     def lr_scheduler_step(self, scheduler, optimizer_idx):
@@ -147,8 +148,9 @@ class LitAutoRegression(pl.LightningModule):
 
     def configure_optimizers(self):
         optim = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.hparams.train_config.learning_rate
+            [p for p in self.model.parameters() if p.requires_grad],
+            lr=self.hparams.train_config.learning_rate,
+            betas=(0.9, 0.95),
         )
         scheduler_optim = CosineLRScheduler(optim, **self.hparams.train_config.cosine_scheduler)
         scheduler = {
@@ -187,7 +189,7 @@ class LitAutoRegression(pl.LightningModule):
             min_new_tokens=l + 1,
             max_new_tokens=l + 1,
             do_sample=True,
-            top_k=10,
+            top_k=256,
             temperature=1.0,
             # eos_token_id=self.processer.eos_token_id,
             forced_eos_token_id=None,
@@ -226,10 +228,10 @@ class LitAutoRegression(pl.LightningModule):
             min_new_tokens=(l - (l // 2)) + 1,
             max_new_tokens=(l - (l // 2)) + 1,
             do_sample=True,
-            top_k=10,
+            top_k=256,
             temperature=1.0,
             # eos_token_id=self.processer.codebook_tokenizer.eos_token_id,
-                forced_eos_token_id=None,
+            forced_eos_token_id=None,
             use_cache=True,
         )
         out_half = out_half[:, 1: -1]

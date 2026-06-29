@@ -5,7 +5,8 @@ import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from transformers import PreTrainedConfig, PreTrainedModel, GenerationMixin, M2M100ForConditionalGeneration, BartModel, \
-    Qwen3VLForConditionalGeneration, BertModel
+    Qwen3VLForConditionalGeneration, BertModel, CLIPTextModel, BartForConditionalGeneration, T5ForConditionalGeneration, \
+    T5EncoderModel, T5Config, GPT2PreTrainedModel
 
 from transformers import initialization as init
 from transformers.activations import ACT2FN
@@ -23,8 +24,10 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, is_torchdynamo_compiling, logging, \
     torch_compilable_check
+from transformers.utils.output_capturing import OutputRecorder
 
 logger = logging.get_logger(__name__)
+
 
 class TextArtT5Config(PreTrainedConfig):
     model_type = "textart_t5"
@@ -55,8 +58,6 @@ class TextArtT5Config(PreTrainedConfig):
             attention_dropout=0.0,
             activation_dropout=0.0,
             init_std=0.02,
-            classifier_dropout=0.0,
-            scale_embedding=False,
             use_cache=True,
 
             encoder_pad_token_id=0,
@@ -68,6 +69,7 @@ class TextArtT5Config(PreTrainedConfig):
             unk_token_id=257,
             bos_token_id=258,
             eos_token_id=259,
+
             decoder_start_token_id=258,
             forced_eos_token_id=259,
             is_encoder_decoder=True,
@@ -95,10 +97,8 @@ class TextArtT5Config(PreTrainedConfig):
         self.init_std = init_std
         self.encoder_layerdrop = encoder_layerdrop
         self.decoder_layerdrop = decoder_layerdrop
-        self.classifier_dropout = classifier_dropout
         self.use_cache = use_cache
         self.num_hidden_layers = encoder_layers
-        self.scale_embedding = scale_embedding  # scale factor will be sqrt(d_model) if True
 
         self.encoder_pad_token_id = encoder_pad_token_id
         self.encoder_unk_token_id = encoder_unk_token_id
@@ -123,6 +123,7 @@ class TextArtT5Config(PreTrainedConfig):
             is_encoder_decoder=is_encoder_decoder,
             **kwargs,
         )
+
 
 class TextArtT5LearnedPositionalEmbedding(nn.Embedding):
     """
@@ -186,7 +187,7 @@ class TextArtT5Attention(nn.Module):
             num_heads: int,
             dropout: float = 0.0,
             is_decoder: bool = False,
-            bias: bool = False,
+            bias: bool = True,
             is_causal: bool = False,
             config: TextArtT5Config | None = None,
             layer_idx: int | None = None,
@@ -225,12 +226,10 @@ class TextArtT5Attention(nn.Module):
             key_value_states: torch.Tensor | None = None,
             past_key_values: Cache | None = None,
             attention_mask: torch.Tensor | None = None,
-            output_attentions: bool = False,
-            cache_position: torch.Tensor | None = None,
             # TODO: we need a refactor so that the different attention modules can get their specific kwargs
             # ATM, we have mixed things encoder, decoder, and encoder-decoder attn
             **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Input shape: Batch x Time x Channel"""
 
         # if key_value_states are provided this layer is used as a cross-attention layer
@@ -238,14 +237,12 @@ class TextArtT5Attention(nn.Module):
         is_cross_attention = key_value_states is not None
 
         # determine input shapes
-        bsz, tgt_len = hidden_states.shape[:-1]
-        src_len = key_value_states.shape[1] if is_cross_attention else tgt_len
+        input_shape = hidden_states.shape[:-1]
 
-        q_input_shape = (bsz, tgt_len, -1, self.head_dim)
-        kv_input_shape = (bsz, src_len, -1, self.head_dim)
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
         # get query proj
-        query_states = self.q_proj(hidden_states).view(*q_input_shape).transpose(1, 2)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         is_updated = False
         if past_key_values is not None:
@@ -267,15 +264,12 @@ class TextArtT5Attention(nn.Module):
         else:
             key_states = self.k_proj(current_states)
             value_states = self.v_proj(current_states)
-            key_states = key_states.view(*kv_input_shape).transpose(1, 2)
-            value_states = value_states.view(*kv_input_shape).transpose(1, 2)
+            kv_shape = (*current_states.shape[:-1], -1, self.head_dim)
+            key_states = key_states.view(kv_shape).transpose(1, 2)
+            value_states = value_states.view(kv_shape).transpose(1, 2)
 
             if past_key_values is not None:
-                # save all key/value_states to cache to be re-used for fast auto-regressive generation
-                cache_position = cache_position if not is_cross_attention else None
-                key_states, value_states = curr_past_key_values.update(
-                    key_states, value_states, self.layer_idx, {"cache_position": cache_position}
-                )
+                key_states, value_states = curr_past_key_values.update(key_states, value_states, self.layer_idx)
                 # set flag that curr layer for cross-attn is already updated so we can re-use in subsequent calls
                 if is_cross_attention and isinstance(past_key_values, EncoderDecoderCache):
                     past_key_values.is_updated[self.layer_idx] = True
@@ -291,11 +285,10 @@ class TextArtT5Attention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.dropout,
             scaling=self.scaling,
-            output_attentions=output_attentions,
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(bsz, tgt_len, -1).contiguous()
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.out_proj(attn_output)
 
         return attn_output, attn_weights
@@ -312,7 +305,7 @@ class TextArtT5MLP(nn.Module):
             activation_function: str = "gelu",
             dropout: float = 0.0,
             activation_dropout: float = 0.0,
-            bias: bool = False,
+            bias: bool = True,
     ):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim, bias=bias)
@@ -357,24 +350,15 @@ class TextArtT5EncoderLayer(GradientCheckpointingLayer):
             self,
             hidden_states: torch.FloatTensor,
             attention_mask: torch.FloatTensor,
-            output_attentions: bool | None = False,
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor | None]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`): attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-        """
+            **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
         # Pre-norm: apply LayerNorm before attention
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states, attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            output_attentions=output_attentions,
+            **kwargs,
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
@@ -392,12 +376,7 @@ class TextArtT5EncoderLayer(GradientCheckpointingLayer):
             clamp_value = torch.finfo(hidden_states.dtype).max - 1000
             hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
 
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (attn_weights,)
-
-        return outputs
+        return hidden_states
 
 
 class TextArtT5DecoderLayer(GradientCheckpointingLayer):
@@ -445,55 +424,34 @@ class TextArtT5DecoderLayer(GradientCheckpointingLayer):
             encoder_hidden_states: torch.Tensor | None = None,
             encoder_attention_mask: torch.Tensor | None = None,
             past_key_values: Cache | None = None,
-            output_attentions: bool | None = False,
             use_cache: bool | None = True,
-            cache_position: torch.Tensor | None = None,
-    ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`): attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
-            encoder_hidden_states (`torch.FloatTensor`):
-                cross attention input to the layer of shape `(batch, seq_len, embed_dim)`
-            encoder_attention_mask (`torch.FloatTensor`): encoder attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
-            past_key_values (`Cache`): cached past key and value projection states
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
-                cache in the correct position and to infer the complete sequence length.
-        """
+            **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
         # Pre-norm: Self Attention
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights = self.self_attn(
+        hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
-            output_attentions=output_attentions,
-            cache_position=cache_position,
+            **kwargs,
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
         # Cross-Attention Block
-        cross_attn_weights = None
         if encoder_hidden_states is not None:
             residual = hidden_states
             hidden_states = self.encoder_attn_layer_norm(hidden_states)
 
-            hidden_states, cross_attn_weights = self.encoder_attn(
+            hidden_states, _ = self.encoder_attn(
                 hidden_states=hidden_states,
                 key_value_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
                 past_key_values=past_key_values,
-                output_attentions=output_attentions,
-                cache_position=cache_position,
+                **kwargs,
             )
             hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
             hidden_states = residual + hidden_states
@@ -505,12 +463,7 @@ class TextArtT5DecoderLayer(GradientCheckpointingLayer):
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (self_attn_weights, cross_attn_weights)
-
-        return outputs
+        return hidden_states
 
 
 class TextArtT5PreTrainedModel(PreTrainedModel):
@@ -543,38 +496,42 @@ class TextArtT5PreTrainedModel(PreTrainedModel):
 class TextArtT5WrapperTextEncoder(TextArtT5PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
-        self.model = BertModel.from_pretrained(config.encoder_model_id_or_path)
-        self.proj = nn.Linear(self.model.config.hidden_size, config.hidden_size)
-        self.norm = nn.LayerNorm(config.hidden_size)
+        self.model = CLIPTextModel.from_pretrained(config.encoder_model_id_or_path)
+        # self.proj = nn.Linear(self.model.config.hidden_size, config.hidden_size)
+        # self.norm = nn.LayerNorm(config.hidden_size)
 
-        for p in self.model.parameters():
-            p.requires_grad = False
-        self.model.eval()
+        # for p in self.model.parameters():
+        #     p.requires_grad = False
+        # self.model.eval()
 
-    def train(self, mode: bool = True):
-        super().train(mode)
-        self.model.train(False)
-        return self
+    # def train(self, mode: bool = True):
+    #     super().train(mode)
+    #     self.model.train(False)
+    #     return self
 
     def forward(
             self,
             input_ids: torch.LongTensor | None = None,
             attention_mask: torch.Tensor | None = None,
-            token_type_ids: torch.Tensor | None = None,
+            # token_type_ids: torch.Tensor | None = None,
             return_dict: bool | None = None,
             **kwargs,
     ) -> tuple | BaseModelOutput:
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                **kwargs,
-            )
-            last_hidden_state = outputs.last_hidden_state
-
-        last_hidden_state = self.proj(last_hidden_state)
-        last_hidden_state = self.norm(last_hidden_state)
+        # with torch.no_grad():
+        #     outputs = self.model(
+        #         input_ids=input_ids,
+        #         attention_mask=attention_mask,
+        #         # token_type_ids=token_type_ids,
+        #         # **kwargs,
+        #     )
+        #     last_hidden_state = outputs.last_hidden_state
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        last_hidden_state = outputs.last_hidden_state
+        # last_hidden_state = self.proj(last_hidden_state)
+        # last_hidden_state = self.norm(last_hidden_state)
 
         if not return_dict:
             return tuple(v for v in [last_hidden_state, None, None] if v is not None)
@@ -582,8 +539,13 @@ class TextArtT5WrapperTextEncoder(TextArtT5PreTrainedModel):
         return BaseModelOutput(
             last_hidden_state=last_hidden_state, hidden_states=None, attentions=None
         )
-class TextArtT5TextEncoder(TextArtT5PreTrainedModel):
 
+
+class TextArtT5TextEncoder(TextArtT5PreTrainedModel):
+    _can_record_outputs = {
+        "hidden_states": TextArtT5EncoderLayer,
+        "attentions": TextArtT5Attention,
+    }
     def __init__(self, config: TextArtT5Config):
         super().__init__(config)
 
@@ -594,7 +556,7 @@ class TextArtT5TextEncoder(TextArtT5PreTrainedModel):
         self.padding_idx = config.encoder_pad_token_id
         self.max_source_positions = config.max_position_embeddings
 
-        self.embed_tokens = nn.Embedding(config.encoder_vocab_size, embed_dim, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.encoder_vocab_size, embed_dim,)
         self.embed_positions = TextArtT5LearnedPositionalEmbedding(
             config.max_position_embeddings,
             embed_dim,
@@ -602,7 +564,6 @@ class TextArtT5TextEncoder(TextArtT5PreTrainedModel):
 
         self.layers = nn.ModuleList(
             [TextArtT5EncoderLayer(config, layer_idx=i) for i in range(config.encoder_layers)])
-        self.layernorm_embedding = nn.LayerNorm(embed_dim)
         self.final_layer_norm = nn.LayerNorm(embed_dim)
 
         self.gradient_checkpointing = False
@@ -614,66 +575,18 @@ class TextArtT5TextEncoder(TextArtT5PreTrainedModel):
             input_ids: torch.LongTensor | None = None,
             attention_mask: torch.Tensor | None = None,
             inputs_embeds: torch.FloatTensor | None = None,
-            output_attentions: bool | None = None,
-            output_hidden_states: bool | None = None,
-            return_dict: bool | None = None,
             **kwargs,
-    ) -> tuple | BaseModelOutput:
-        r"""
-        Args:
-            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-                Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
-                provide it.
-
-                Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-                [`PreTrainedTokenizer.__call__`] for details.
-
-                [What are input IDs?](../glossary#input-ids)
-            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
-                - 1 for tokens that are **not masked**,
-                - 0 for tokens that are **masked**.
-
-                [What are attention masks?](../glossary#attention-mask)
-            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-                Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation.
-                This is useful if you want more control over how to convert `input_ids` indices into associated vectors
-                than the model's internal embedding lookup matrix.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            output_hidden_states (`bool`, *optional*):
-                Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
-                for more detail.
-            return_dict (`bool`, *optional*):
-                Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
-        """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # retrieve input_ids and inputs_embeds
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        elif input_ids is not None:
-            input = input_ids
-            input_ids = input_ids.view(-1, input_ids.shape[-1])
-        elif inputs_embeds is not None:
-            input = inputs_embeds[:, :, -1]
-        else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
+    ) -> BaseModelOutput:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        embed_pos = self.embed_positions(input)
+        embed_pos = self.embed_positions(inputs_embeds)
         embed_pos = embed_pos.to(inputs_embeds.device)
 
         hidden_states = inputs_embeds + embed_pos
-        hidden_states = self.layernorm_embedding(hidden_states)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
 
         attention_mask = create_bidirectional_mask(
@@ -682,12 +595,7 @@ class TextArtT5TextEncoder(TextArtT5PreTrainedModel):
             attention_mask=attention_mask,
         )
 
-        encoder_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
-
         for idx, encoder_layer in enumerate(self.layers):
-            if output_hidden_states:
-                encoder_states = encoder_states + (hidden_states,)
             # add LayerDrop (see https://huggingface.co/papers/1909.11556 for description)
             to_drop = False
             if self.training:
@@ -695,41 +603,26 @@ class TextArtT5TextEncoder(TextArtT5PreTrainedModel):
                 if dropout_probability < self.layerdrop:  # skip the layer
                     to_drop = True
 
-            if to_drop:
-                layer_outputs = (None, None)
-            else:
-                layer_outputs = encoder_layer(
+            if not to_drop:
+                hidden_states = encoder_layer(
                     hidden_states,
                     attention_mask,
-                    output_attentions=output_attentions,
+                    **kwargs,
                 )
 
-                hidden_states = layer_outputs[0]
-
-            if output_attentions:
-                all_attentions = all_attentions + (layer_outputs[1],)
-
-        if output_hidden_states:
-            encoder_states = encoder_states + (hidden_states,)
-
-        # Apply final layer norm for pre-norm architecture
         hidden_states = self.final_layer_norm(hidden_states)
 
-        if not return_dict:
-            return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
         return BaseModelOutput(
-            last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
+            last_hidden_state=hidden_states,
         )
 
-
 class TextArtT5CodeBookDecoder(TextArtT5PreTrainedModel):
-    """
-    Transformer decoder consisting of *config.decoder_layers* layers. Each layer is a [`BartDecoderLayer`]
 
-    Args:
-        config: BartConfig
-        embed_tokens (nn.Embedding): output embedding
-    """
+    _can_record_outputs = {
+        "hidden_states": TextArtT5DecoderLayer,
+        "attentions": OutputRecorder(TextArtT5Attention, index=1, layer_name="self_attn"),
+        "cross_attentions": OutputRecorder(TextArtT5Attention, index=1, layer_name="encoder_attn"),
+    }
 
     def __init__(self, config: TextArtT5Config):
         super().__init__(config)
@@ -737,9 +630,8 @@ class TextArtT5CodeBookDecoder(TextArtT5PreTrainedModel):
         self.layerdrop = config.decoder_layerdrop
         self.padding_idx = config.pad_token_id
         self.max_target_positions = config.max_position_embeddings
-        embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model,)
         self.embed_positions = TextArtT5LearnedPositionalEmbedding(
             config.max_position_embeddings,
             config.d_model,
@@ -748,7 +640,6 @@ class TextArtT5CodeBookDecoder(TextArtT5PreTrainedModel):
         self.layers = nn.ModuleList(
             [TextArtT5DecoderLayer(config, layer_idx=i) for i in range(config.decoder_layers)])
 
-        self.layernorm_embedding = nn.LayerNorm(config.d_model)
         self.final_layer_norm = nn.LayerNorm(config.d_model)
 
         self.gradient_checkpointing = False
@@ -764,94 +655,13 @@ class TextArtT5CodeBookDecoder(TextArtT5PreTrainedModel):
             past_key_values: Cache | None = None,
             inputs_embeds: torch.FloatTensor | None = None,
             use_cache: bool | None = None,
-            output_attentions: bool | None = None,
-            output_hidden_states: bool | None = None,
-            return_dict: bool | None = None,
-            cache_position: torch.LongTensor | None = None,
             **kwargs,
-    ) -> tuple | BaseModelOutputWithPastAndCrossAttentions:
-        r"""
-        Args:
-            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-                Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
-                provide it.
-
-                Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-                [`PreTrainedTokenizer.__call__`] for details.
-
-                [What are input IDs?](../glossary#input-ids)
-            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
-                - 1 for tokens that are **not masked**,
-                - 0 for tokens that are **masked**.
-
-                [What are attention masks?](../glossary#attention-mask)
-            encoder_hidden_states (`torch.FloatTensor` of shape `(batch_size, encoder_sequence_length, hidden_size)`, *optional*):
-                Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention
-                of the decoder.
-            encoder_attention_mask (`torch.LongTensor` of shape `(batch_size, encoder_sequence_length)`, *optional*):
-                Mask to avoid performing cross-attention on padding tokens indices of encoder input_ids. Mask values
-                selected in `[0, 1]`:
-
-                - 1 for tokens that are **not masked**,
-                - 0 for tokens that are **masked**.
-
-                [What are attention masks?](../glossary#attention-mask)
-            past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-                It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
-
-                Contains pre-computed hidden-states (key and values in the self-attention blocks and in the
-                cross-attention blocks) that can be used (see `past_key_values` input) to speed up sequential decoding.
-
-                If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those
-                that don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of
-                all `decoder_input_ids` of shape `(batch_size, sequence_length)`.
-            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-                Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation.
-                This is useful if you want more control over how to convert `input_ids` indices into associated vectors
-                than the model's internal embedding lookup matrix.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            output_hidden_states (`bool`, *optional*):
-                Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
-                for more detail.
-            return_dict (`bool`, *optional*):
-                Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
-                cache in the correct position and to infer the complete sequence length.
-        """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        if self.gradient_checkpointing and self.training:
-            if use_cache:
-                logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
-
-        # retrieve input_ids and inputs_embeds
+    ) -> BaseModelOutputWithPastAndCrossAttentions:
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
-        elif input_ids is not None:
-            input = input_ids
-            input_shape = input.shape
-            input_ids = input_ids.view(-1, input_shape[-1])
-        elif inputs_embeds is not None:
-            input_shape = inputs_embeds.size()[:-1]
-            input = inputs_embeds[:, :, -1]
-        else:
-            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+            raise ValueError("You must specify exactly one of decoder_input_ids or decoder_inputs_embeds")
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input)
+            inputs_embeds = self.embed_tokens(input_ids)
 
         # initialize `past_key_values`
         if use_cache and past_key_values is None:
@@ -863,10 +673,7 @@ class TextArtT5CodeBookDecoder(TextArtT5PreTrainedModel):
 
         batch_size, seq_length = inputs_embeds.size()[:-1]
         past_key_values_length = past_key_values.get_seq_length() if past_key_values is not None else 0
-        if cache_position is None:
-            cache_position = torch.arange(
-                past_key_values_length, past_key_values_length + seq_length, device=inputs_embeds.device
-            )
+        position_ids = torch.arange(seq_length, device=inputs_embeds.device) + past_key_values_length
 
         if attention_mask is None and not is_torchdynamo_compiling():
             # required mask seq length can be calculated via length of past cache
@@ -883,7 +690,6 @@ class TextArtT5CodeBookDecoder(TextArtT5PreTrainedModel):
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=self_attn_cache,
         )
         encoder_attention_mask = create_bidirectional_mask(
@@ -894,64 +700,33 @@ class TextArtT5CodeBookDecoder(TextArtT5PreTrainedModel):
         )
 
         # embed positions
-        positions = self.embed_positions(input, past_key_values_length, position_ids=cache_position)
+        positions = self.embed_positions(input_ids, past_key_values_length, position_ids=position_ids)
         positions = positions.to(inputs_embeds.device)
 
         hidden_states = inputs_embeds + positions
-        hidden_states = self.layernorm_embedding(hidden_states)
 
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
 
-        # decoder layers
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-        all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
-
         for idx, decoder_layer in enumerate(self.layers):
             # add LayerDrop (see https://huggingface.co/papers/1909.11556 for description)
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
             if self.training:
                 dropout_probability = torch.rand([])
                 if dropout_probability < self.layerdrop:
                     continue
 
-            layer_outputs = decoder_layer(
+            hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask,
-                encoder_hidden_states,  # as a positional argument for gradient checkpointing
+                encoder_hidden_states,
                 encoder_attention_mask=encoder_attention_mask,
                 past_key_values=past_key_values,
-                output_attentions=output_attentions,
                 use_cache=use_cache,
-                cache_position=cache_position,
+                **kwargs,
             )
-            hidden_states = layer_outputs[0]
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
-                if encoder_hidden_states is not None:
-                    all_cross_attentions += (layer_outputs[2],)
-
-         # add hidden states from the last decoder layer
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
-        # Apply final layer norm for pre-norm architecture
         hidden_states = self.final_layer_norm(hidden_states)
-
-        if not return_dict:
-            return tuple(
-                v
-                for v in [hidden_states, past_key_values, all_hidden_states, all_self_attns, all_cross_attentions]
-                if v is not None
-            )
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-            cross_attentions=all_cross_attentions,
         )
 
 
@@ -979,76 +754,23 @@ class TextArtT5Model(TextArtT5PreTrainedModel):
             inputs_embeds: torch.FloatTensor | None = None,
             decoder_inputs_embeds: torch.FloatTensor | None = None,
             use_cache: bool | None = None,
-            output_attentions: bool | None = None,
-            output_hidden_states: bool | None = None,
-            return_dict: bool | None = None,
-            cache_position: torch.LongTensor | None = None,
             **kwargs,
     ) -> tuple | Seq2SeqModelOutput:
-        r"""
-        decoder_input_ids (`torch.LongTensor` of shape `(batch_size, target_sequence_length)`, *optional*):
-            Indices of decoder input sequence tokens in the vocabulary.
-
-            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-            [`PreTrainedTokenizer.__call__`] for details.
-
-            [What are decoder input IDs?](../glossary#decoder-input-ids)
-
-            Bart uses the `eos_token_id` as the starting token for `decoder_input_ids` generation. If `past_key_values`
-            is used, optionally only the last `decoder_input_ids` have to be input (see `past_key_values`).
-
-            For translation and summarization training, `decoder_input_ids` should be provided. If no
-            `decoder_input_ids` is provided, the model will create this tensor by shifting the `input_ids` to the right
-            for denoising pre-training following the paper.
-        decoder_attention_mask (`torch.LongTensor` of shape `(batch_size, target_sequence_length)`, *optional*):
-            Default behavior: generate a tensor that ignores pad tokens in `decoder_input_ids`. Causal mask will also
-            be used by default.
-
-            If you want to change padding behavior, you should read [`modeling_bart._prepare_decoder_attention_mask`]
-            and modify to your needs. See diagram 1 in [the paper](https://huggingface.co/papers/1910.13461) for more
-            information on the default strategy.
-        """
-        # DELETE THIS
-        # different to other models, Bart automatically creates decoder_input_ids from
-        # input_ids if no decoder_input_ids are provided
-        # if decoder_input_ids is None and decoder_inputs_embeds is None:
-        #     if input_ids is None:
-        #         raise ValueError(
-        #             "If no `decoder_input_ids` or `decoder_inputs_embeds` are "
-        #             "passed, `input_ids` cannot be `None`. Please pass either "
-        #             "`input_ids` or `decoder_input_ids` or `decoder_inputs_embeds`."
-        #         )
-        #
-        #     decoder_input_ids = shift_tokens_right(
-        #         input_ids, self.config.pad_token_id, self.config.decoder_start_token_id
-        #     )
-
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         if encoder_outputs is None:
-            encoder_outputs = self.encoder(
+            encoder_outputs: BaseModelOutput = self.encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 inputs_embeds=inputs_embeds,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
+                **kwargs,
             )
-        # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
-        elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
+        elif not isinstance(encoder_outputs, BaseModelOutput):
             encoder_outputs = BaseModelOutput(
                 last_hidden_state=encoder_outputs[0],
                 hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
                 attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
             )
-
-        # decoder outputs consists of (dec_features, past_key_values, dec_hidden, dec_attn)
-        decoder_outputs = self.decoder(
+        print("encoder_outputs.last_hidden_state", encoder_outputs.last_hidden_state)
+        decoder_outputs: BaseModelOutputWithPastAndCrossAttentions = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
             encoder_hidden_states=encoder_outputs[0],
@@ -1056,14 +778,8 @@ class TextArtT5Model(TextArtT5PreTrainedModel):
             past_key_values=past_key_values,
             inputs_embeds=decoder_inputs_embeds,
             use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
+            **kwargs,
         )
-
-        if not return_dict:
-            return decoder_outputs + encoder_outputs
 
         return Seq2SeqModelOutput(
             last_hidden_state=decoder_outputs.last_hidden_state,
@@ -1086,16 +802,10 @@ class TextArtT5ForConditionalGeneration(TextArtT5PreTrainedModel, GenerationMixi
     def __init__(self, config: TextArtT5Config):
         super().__init__(config)
         self.model = TextArtT5Model(config)
-        self.lm_head = nn.Linear(config.d_model, self.config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.d_model, self.config.vocab_size, bias=True)
 
         # Initialize weights and apply final processing
         self.post_init()
-
-    def resize_token_embeddings(
-            self, new_num_tokens: int, pad_to_multiple_of: int | None = None, mean_resizing: bool = True
-    ) -> nn.Embedding:
-        new_embeddings = super().resize_token_embeddings(new_num_tokens, pad_to_multiple_of, mean_resizing)
-        return new_embeddings
 
     @auto_docstring
     def forward(
@@ -1110,15 +820,10 @@ class TextArtT5ForConditionalGeneration(TextArtT5PreTrainedModel, GenerationMixi
             decoder_inputs_embeds: torch.FloatTensor | None = None,
             labels: torch.LongTensor | None = None,
             use_cache: bool | None = None,
-            output_attentions: bool | None = None,
-            output_hidden_states: bool | None = None,
-            return_dict: bool | None = None,
-            cache_position: torch.LongTensor | None = None,
             **kwargs,
     ) -> tuple | Seq2SeqLMOutput:
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.model(
+        outputs: Seq2SeqModelOutput = self.model(
             input_ids,
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
@@ -1128,10 +833,7 @@ class TextArtT5ForConditionalGeneration(TextArtT5PreTrainedModel, GenerationMixi
             inputs_embeds=inputs_embeds,
             decoder_inputs_embeds=decoder_inputs_embeds,
             use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
+            # **kwargs,
         )
 
         lm_logits = self.lm_head(outputs[0])
@@ -1140,11 +842,7 @@ class TextArtT5ForConditionalGeneration(TextArtT5PreTrainedModel, GenerationMixi
         if labels is not None:
             labels = labels.to(lm_logits.device)
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.reshape(-1), )
-
-        if not return_dict:
-            output = (lm_logits,) + outputs[1:]
-            return ((loss,) + output) if loss is not None else output
+            loss = loss_fct(lm_logits.view(-1, self.config.vocab_size).float(), labels.reshape(-1))
 
         return Seq2SeqLMOutput(
             loss=loss,

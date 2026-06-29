@@ -28,7 +28,6 @@ torch.backends.cudnn.benchmark = True
 def train(config: Config):
     pl.seed_everything(config.seed_everything, workers=True)
 
-    # model_module = LitVQGAN.load_from_checkpoint("pretrain_ckpt/vqgan_pretrain.ckpt", **config.model)
     vqgan_config = VQGANConfig(
         n_embed=256,
         embed_dim=32,
@@ -46,7 +45,6 @@ def train(config: Config):
     )
     model_module = LitVQGAN(**config.model, vqgan_config=vqgan_config)
 
-    # data_module = VQGANDatamodule(**config.data)
     data_module = CelebADatamodule(**config.data)
 
 
